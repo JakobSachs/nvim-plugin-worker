@@ -2,7 +2,11 @@ import os
 import re
 import json
 import logging
+import time
+
 from dataclasses import dataclass
+
+import schedule
 import coloredlogs
 import requests
 from pymongo.database import Database
@@ -47,13 +51,9 @@ def get_repo_name(url: HttpUrl) -> tuple[str, str]:
     url_str: str = re.sub(r"https?://", "", url.path)
     # remove trailing slash
     url_str = re.sub(r"/$", "", url_str)
-    # split url by '/'
     url_strs = url_str.split("/")
-    # get repo name and author
-    repo_name = url_strs[-1]
-    author = url_strs[-2]
-    # return repo name
-    return author, repo_name
+
+    return url_strs[-2], url_strs[-1]
 
 
 def construct_repo_from_api(api_response: dict) -> Repository:
@@ -77,7 +77,7 @@ def update_repo_stats(ctx: Context):
     # get repo list from repo-list db
     repo_list = get_repo_list(ctx)
 
-    for rp in repo_list[:10]:
+    for rp in repo_list:
         # query github for repo info
         user, repo = get_repo_name(rp)
         r = requests.get(
@@ -144,3 +144,9 @@ if __name__ == "__main__":
         github_token=os.environ.get("GITHUB_TOKEN"),
         logger=logger,
     )
+
+    # start update loop
+    while True:
+        schedule.every(5).minutes.do(update_repo_stats, context)
+        schedule.run_pending()
+        time.sleep(1)

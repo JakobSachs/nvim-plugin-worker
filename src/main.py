@@ -2,11 +2,9 @@ import os
 import re
 import json
 import logging
-import time
 
 from dataclasses import dataclass
 
-import schedule
 import coloredlogs
 import requests
 from pymongo.database import Database
@@ -144,9 +142,7 @@ if __name__ == "__main__":
         github_token=os.environ.get("GITHUB_TOKEN"),
         logger=logger,
     )
+    
+    log_structured_message(logger, "Starting scheduled job")
+    update_repo_stats(context)
 
-    # start update loop
-    while True:
-        schedule.every(5).minutes.do(update_repo_stats, context)
-        schedule.run_pending()
-        time.sleep(1)

@@ -127,7 +127,7 @@ if __name__ == "__main__":
     )
 
     # setup db connection
-    client = MongoClient(uri, server_api=ServerApi("1"), uuidRepresentation="standard")
+    client = MongoClient(uri, server_api=ServerApi("1"), uuidRepresentation="standard",tsl=True)
     try:
         client.admin.command("ping", check=True)
         log_structured_message(logger, "Successfully connected to the Atlas Cluster")

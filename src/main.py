@@ -1,7 +1,6 @@
 import os
 import sys
 import re
-import json
 import logging
 
 from datetime import datetime
@@ -62,11 +61,12 @@ def get_repo_name(url: HttpUrl) -> tuple[str, str]:
 
 
 def get_README_from_api(user: str, repo: str, branch: str) -> str | None:
-    # try main branch
+    # try default spelling
     url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/README.md"
     r = requests.get(url, timeout=5)
     if r.status_code == 200:
         return r.text
+    # TODO: try other common readme names
     return None
 
 
@@ -87,9 +87,7 @@ def construct_repo_from_api(ctxt: Context, api_response: dict) -> Repository | N
             last_updated=api_response["updated_at"],
         )
     except Exception as e:
-        log_structured_message(
-            ctxt.logger, f"Error: failed to construct repo from api response: {e}"
-        )
+        ctxt.logger.error(f"Error: failed to construct repo from api response: {e}")
         return None
 
     return repo
@@ -149,14 +147,6 @@ def create_repo_in_db(ctx: Context, rp: HttpUrl, exists: bool = False):
             raise Exception(f"Error: Failed to insert repo into db: {res}")
 
 
-def log_structured_message(log, message, **kwargs):
-    """
-    Helper function to create a structured log message
-    """
-    log_message = {"message": message, **kwargs}
-    log.info(json.dumps(log_message))
-
-
 # main
 if __name__ == "__main__":
     # setup logging
@@ -191,7 +181,7 @@ if __name__ == "__main__":
         logger=logger,
     )
 
-    log_structured_message(logger, "Starting scheduled job")
+    logger.info("Starting scheduled job")
     repos: list[HttpUrl] = get_repo_list(context)
 
     # NOTE: Yes i could parrallelize this but i dont want to get rate limited,
@@ -201,9 +191,7 @@ if __name__ == "__main__":
         update = False
         res = context.db_repos["repo"].find_one({"url": str(repo)})
         if res is not None:  # update repo
-            log_structured_message(
-                logger, f"Repo already exists in db: {repo}, {res['_id']}"
-            )
+            logger.debug(f"Repo already exists in db: {repo}, {res['_id']}")
             update = True
 
             # update star count in history
@@ -216,9 +204,8 @@ if __name__ == "__main__":
             if not res.acknowledged:
                 raise Exception(f"Error: Failed to insert star update into db: {res}")
 
-
         try:  # create repo in db
             create_repo_in_db(context, repo, exists=update)
         except Exception as e:
-            log_structured_message(logger, f"Failed to process: {e}")
+            logger.error(f"Failed to process: {e}")
             continue

@@ -1,7 +1,10 @@
 import os
+import sys
 import re
 import json
 import logging
+
+from datetime import datetime
 
 from dataclasses import dataclass
 
@@ -46,7 +49,11 @@ def get_repo_name(url: HttpUrl) -> tuple[str, str]:
     # get repo name and author from url
 
     # remove http(s)://
-    url_str: str = re.sub(r"https?://", "", url.path)
+    path = url.path
+    if not path:
+        raise Exception(f"Error: failed to get repo name from {url}")
+
+    url_str: str = re.sub(r"https?://", "", path)
     # remove trailing slash
     url_str = re.sub(r"/$", "", url_str)
     url_strs = url_str.split("/")
@@ -54,50 +61,92 @@ def get_repo_name(url: HttpUrl) -> tuple[str, str]:
     return url_strs[-2], url_strs[-1]
 
 
-def construct_repo_from_api(api_response: dict) -> Repository:
+def get_README_from_api(user: str, repo: str, branch: str) -> str | None:
+    # try main branch
+    url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/README.md"
+    r = requests.get(url, timeout=5)
+    if r.status_code == 200:
+        return r.text
+    return None
+
+
+def construct_repo_from_api(ctxt: Context, api_response: dict) -> Repository | None:
     """
     Constructs a Repository object from a github api response.
     TODO: add error handling
     """
     # construct repo info from repo dict
-    return Repository(
-        name=api_response["name"],
-        author=api_response["owner"]["login"],
-        url=api_response["html_url"],
-        description=api_response["description"],
-        stars=api_response["stargazers_count"],
-        language=api_response["language"],
-        last_updated=api_response["updated_at"],
+    try:
+        repo = Repository(
+            name=api_response["name"],
+            author=api_response["owner"]["login"],
+            url=api_response["html_url"],
+            description=api_response["description"],
+            stars=api_response["stargazers_count"],
+            language=api_response["language"].title(),
+            last_updated=api_response["updated_at"],
+        )
+    except Exception as e:
+        log_structured_message(
+            ctxt.logger, f"Error: failed to construct repo from api response: {e}"
+        )
+        return None
+
+    return repo
+
+
+def create_repo_in_db(ctx: Context, rp: HttpUrl, exists: bool = False):
+    """
+    Creates a repo in the db from a github repo url.
+    Assumes that the repo does not already exist in the db.
+    """
+    # query github for repo info
+    user, repo = get_repo_name(rp)
+
+    r = requests.get(
+        f"https://api.github.com/repos/{user}/{repo}",
+        headers={"Authorization": f"token {ctx.github_token}"},
+        timeout=5,
     )
 
+    if r.status_code != 200:
+        raise Exception(f"Error: failed to get repo info for {rp} from GitHub API")
 
-def update_repo_stats(ctx: Context):
-    # get repo list from repo-list db
-    repo_list = get_repo_list(ctx)
+    info = r.json()
 
-    for rp in repo_list:
-        # query github for repo info
-        user, repo = get_repo_name(rp)
-        r = requests.get(
-            f"https://api.github.com/repos/{user}/{repo}",
-            headers={"Authorization": f"token {ctx.github_token}"},
-            timeout=5,
+    readme = get_README_from_api(user, repo, info["default_branch"])
+    if readme is None:
+        raise Exception(f"Error: failed to get readme for {rp} from GitHub")
+
+    # construct repo info
+    repo_info = construct_repo_from_api(ctx, info)
+
+    if repo_info is None:
+        raise Exception(f"Error: failed to construct repo from api response")
+
+    # add readme to repo
+    repo_info.readme = readme
+
+    # rename id to _id (since mongo uses _id and pydantic wont let me use underscore)
+    dump = repo_info.model_dump()
+    dump["_id"] = dump.pop("id")
+
+    if exists:
+        # remove _id from dump
+        dump.pop("_id")
+        # update repo
+        res = ctx.db_repos["repo"].update_one(
+            {"url": str(rp)}, {"$set": dump}, comment="updated from scheduled job"
         )
-
-        if r.status_code != 200:
-            log_structured_message(ctx.logger, f"Error: {r.status_code} - {r.text}")
-            continue
-
-        info = r.json()
-        # construct repo info
-        repo_info = construct_repo_from_api(info)
-        log_structured_message(ctx.logger, str(repo_info))
-
-        # insert repo
-        res = ctx.db_repos["repos"].insert_one(repo_info.model_dump())
         if not res.acknowledged:
-            log_structured_message(ctx.logger, "Error: failed to insert repo")
-            continue
+            raise Exception(f"Error: Failed to update repo in db: {res}")
+    else:
+        # insert repo
+        res = ctx.db_repos["repo"].insert_one(
+            dump, comment="inserted from scheduled job"
+        )
+        if not res.acknowledged:
+            raise Exception(f"Error: Failed to insert repo into db: {res}")
 
 
 def log_structured_message(log, message, **kwargs):
@@ -127,22 +176,49 @@ if __name__ == "__main__":
     )
 
     # setup db connection
-    client = MongoClient(uri, server_api=ServerApi("1"), uuidRepresentation="standard",tsl=True)
+    client = MongoClient(uri, server_api=ServerApi("1"), uuidRepresentation="standard")
     try:
         client.admin.command("ping", check=True)
-        log_structured_message(logger, "Successfully connected to the Atlas Cluster")
-    except OperationFailure as e:
-        log_structured_message(
-            logger, "Unable to connect to the Atlas Cluster, error:", kwargs=str(e)
-        )
+        logger.info("Successfully connected to the Atlas Cluster")
+    except OperationFailure as op_e:
+        logger.error(f"Unable to connect to the Atlas Cluster, error: {str(op_e)}")
+        sys.exit(1)
 
     context = Context(
         db_repos=client["repos"],
         db_repo_list=client["repo-list"],
-        github_token=os.environ.get("GITHUB_TOKEN"),
+        github_token=os.environ.get("GITHUB_TOKEN", ""),
         logger=logger,
     )
-    
-    log_structured_message(logger, "Starting scheduled job")
-    update_repo_stats(context)
 
+    log_structured_message(logger, "Starting scheduled job")
+    repos: list[HttpUrl] = get_repo_list(context)
+
+    # NOTE: Yes i could parrallelize this but i dont want to get rate limited,
+    # plus im lazy and this runs like a few times a day so its not a big deal
+    for repo in repos:  # process each repo
+        # check if repo already exists in db
+        update = False
+        res = context.db_repos["repo"].find_one({"url": str(repo)})
+        if res is not None:  # update repo
+            log_structured_message(
+                logger, f"Repo already exists in db: {repo}, {res['_id']}"
+            )
+            update = True
+
+            # update star count in history
+            star_update = {
+                "repo_id": res["_id"],
+                "timestamp": datetime.now(),
+                "stars": res["stars"],
+            }
+            res = context.db_repos["stars_history"].insert_one(star_update)
+            if not res.acknowledged:
+                raise Exception(f"Error: Failed to insert star update into db: {res}")
+
+
+        try:  # create repo in db
+            create_repo_in_db(context, repo, exists=update)
+        except Exception as e:
+            log_structured_message(logger, f"Failed to process: {e}")
+            continue
